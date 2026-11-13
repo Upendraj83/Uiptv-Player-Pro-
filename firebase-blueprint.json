@@ -1,0 +1,69 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile containing sync preferences, favorites list, and recently viewed channel history",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Unique user identifier matching Firebase Auth UID",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User email address",
+          "maxLength": 256
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the user",
+          "maxLength": 100
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "User avatar image URL",
+          "maxLength": 1000
+        },
+        "theme": {
+          "type": "string",
+          "description": "Selected UI theme palette",
+          "enum": ["dark", "amoled"]
+        },
+        "favorites": {
+          "type": "array",
+          "description": "List of favorite channel IDs (max 200)"
+        },
+        "recentlyViewed": {
+          "type": "array",
+          "description": "List of recently viewed channel IDs (max 30)"
+        },
+        "allowAdultChannels": {
+          "type": "boolean",
+          "description": "Whether adult NSFW channels are enabled"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the profile was created (submitted via FieldValue.serverTimestamp())"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the profile was last updated (submitted via FieldValue.serverTimestamp())"
+        }
+      },
+      "required": ["userId", "email", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserProfile"
+      },
+      "description": "User preferences, favorites, theme, and watch history indexed by Firebase Auth UID"
+    }
+  }
+}

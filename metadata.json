@@ -1,0 +1,6 @@
+{
+  "name": "UiPTv Player Pro+",
+  "description": "UiPTv Player is a native Android IPTV player to explore and stream live TV channels worldwide by country, category, and favorites with cloud sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
