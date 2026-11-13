@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import android.net.Uri
+import android.util.Log
 import android.view.ViewGroup
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
@@ -37,6 +39,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -44,6 +47,18 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.example.data.model.StreamSource
 import kotlinx.coroutines.delay
+
+private const val PLAYER_TAG = "PlayerScreen"
+
+private fun sanitizeHttpHeaderValue(raw: String?): String? {
+  if (raw.isNullOrBlank()) return null
+  val cleaned = buildString(raw.length) {
+    for (ch in raw.trim()) {
+      if (ch.code in 0x20..0x7E) append(ch)
+    }
+  }.trim()
+  return cleaned.takeIf { it.isNotEmpty() }
+}
 
 private tailrec fun Context.findActivity(): Activity? =
   when (this) {
@@ -119,26 +134,44 @@ fun PlayerScreen(
   }
 
   val exoPlayer = remember(context) {
-    ExoPlayer.Builder(context)
-      .setWakeMode(C.WAKE_MODE_NETWORK)
+    val renderersFactory = DefaultRenderersFactory(context)
+      .setEnableDecoderFallback(true)
+    ExoPlayer.Builder(context, renderersFactory)
+      .setWakeMode(C.WAKE_MODE_LOCAL)
       .build()
       .apply {
         playWhenReady = true
       }
   }
 
+  var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
+
   DisposableEffect(exoPlayer, lifecycleOwner) {
     val observer = LifecycleEventObserver { _, event ->
       when (event) {
         Lifecycle.Event.ON_PAUSE -> exoPlayer.pause()
-        Lifecycle.Event.ON_RESUME -> if (!allSourcesFailed) exoPlayer.play()
+        Lifecycle.Event.ON_RESUME -> {
+          if (!allSourcesFailed && streams.isNotEmpty()) {
+            if (exoPlayer.playbackState == Player.STATE_IDLE) {
+              exoPlayer.prepare()
+            }
+            exoPlayer.play()
+          }
+        }
         else -> Unit
       }
     }
     lifecycleOwner.lifecycle.addObserver(observer)
     onDispose {
       lifecycleOwner.lifecycle.removeObserver(observer)
-      exoPlayer.release()
+      playerViewRef?.player = null
+      playerViewRef = null
+      runCatching {
+        exoPlayer.stop()
+        exoPlayer.release()
+      }.onFailure { err ->
+        Log.w(PLAYER_TAG, "Failed releasing ExoPlayer", err)
+      }
     }
   }
 
@@ -159,8 +192,9 @@ fun PlayerScreen(
 
       override fun onPlayerError(error: PlaybackException) {
         lastErrorMessage = error.errorCodeName
-        if (sourceIndex + 1 < streams.size) {
-          sourceIndex += 1
+        val nextIndex = sourceIndex + 1
+        if (nextIndex < streams.size) {
+          sourceIndex = nextIndex
         } else {
           isBuffering = false
           allSourcesFailed = true
@@ -184,62 +218,72 @@ fun PlayerScreen(
     lastErrorMessage = null
     isBuffering = true
 
-    val headers = buildMap {
-      if (!stream.userAgent.isNullOrBlank()) put("User-Agent", stream.userAgent)
-      if (!stream.referrer.isNullOrBlank()) put("Referer", stream.referrer)
-    }
-
-    val httpFactory = DefaultHttpDataSource.Factory()
-      .setAllowCrossProtocolRedirects(true)
-      .setConnectTimeoutMs(10_000)
-      .setReadTimeoutMs(12_000)
-      .apply {
-        if (!stream.userAgent.isNullOrBlank()) {
-          setUserAgent(stream.userAgent)
-        }
-        if (headers.isNotEmpty()) {
-          setDefaultRequestProperties(headers)
-        }
+    try {
+      val trimmedUrl = stream.url.trim()
+      val parsedUri = Uri.parse(trimmedUrl)
+      val scheme = parsedUri.scheme?.lowercase()
+      require(scheme == "http" || scheme == "https") {
+        "Unsupported stream protocol: ${scheme ?: "unknown"}"
       }
 
-    val isHlsUrl =
-      stream.url.contains(".m3u8", ignoreCase = true) ||
-        stream.url.contains("hls", ignoreCase = true)
+      val safeUserAgent = sanitizeHttpHeaderValue(stream.userAgent) ?: "UiPTvPlayer/1.0 (Android)"
+      val safeReferrer = sanitizeHttpHeaderValue(stream.referrer)
+      val headers = buildMap {
+        put("User-Agent", safeUserAgent)
+        if (safeReferrer != null) put("Referer", safeReferrer)
+      }
 
-    val mediaItemBuilder = MediaItem.Builder().setUri(stream.url)
-    if (isHlsUrl) {
-      mediaItemBuilder.setMimeType(MimeTypes.APPLICATION_M3U8)
-    }
-    val mediaItem = mediaItemBuilder.build()
+      val httpFactory = DefaultHttpDataSource.Factory()
+        .setAllowCrossProtocolRedirects(true)
+        .setConnectTimeoutMs(10_000)
+        .setReadTimeoutMs(12_000)
+        .setUserAgent(safeUserAgent)
+        .setDefaultRequestProperties(headers)
 
-    val mediaSource =
+      val isHlsUrl = trimmedUrl.contains(".m3u8", ignoreCase = true)
+
+      val mediaItemBuilder = MediaItem.Builder().setUri(parsedUri)
       if (isHlsUrl) {
-        HlsMediaSource.Factory(httpFactory)
-          .setAllowChunklessPreparation(true)
-          .createMediaSource(mediaItem)
-      } else {
-        DefaultMediaSourceFactory(httpFactory).createMediaSource(mediaItem)
+        mediaItemBuilder.setMimeType(MimeTypes.APPLICATION_M3U8)
       }
+      val mediaItem = mediaItemBuilder.build()
 
-    exoPlayer.setMediaSource(mediaSource)
-    exoPlayer.prepare()
-    exoPlayer.playWhenReady = true
+      val mediaSource =
+        if (isHlsUrl) {
+          HlsMediaSource.Factory(httpFactory)
+            .setAllowChunklessPreparation(true)
+            .createMediaSource(mediaItem)
+        } else {
+          DefaultMediaSourceFactory(httpFactory).createMediaSource(mediaItem)
+        }
+
+      exoPlayer.stop()
+      exoPlayer.clearMediaItems()
+      exoPlayer.setMediaSource(mediaSource)
+      exoPlayer.prepare()
+      exoPlayer.playWhenReady = true
+    } catch (err: Throwable) {
+      Log.w(PLAYER_TAG, "Failed preparing stream source $sourceIndex: ${stream.url}", err)
+      lastErrorMessage = err.localizedMessage ?: "Unable to open stream"
+      val nextIndex = sourceIndex + 1
+      if (nextIndex < streams.size) {
+        sourceIndex = nextIndex
+      } else {
+        isBuffering = false
+        allSourcesFailed = true
+        onStreamFailed?.invoke()
+      }
+    }
   }
 
   LaunchedEffect(isMuted, volume) {
-    exoPlayer.volume = if (isMuted) 0f else volume
+    exoPlayer.volume = if (isMuted) 0f else volume.coerceIn(0f, 1f)
   }
 
   Box(
     modifier = modifier
       .fillMaxSize()
       .background(Color.Black)
-      .clickable(
-        interactionSource = remember { MutableInteractionSource() },
-        indication = null,
-      ) {
-        controlsVisible = !controlsVisible
-      }
       .testTag("player_screen"),
   ) {
     AndroidView(
@@ -247,20 +291,43 @@ fun PlayerScreen(
         PlayerView(ctx).apply {
           useController = false
           keepScreenOn = true
+          setShutterBackgroundColor(android.graphics.Color.BLACK)
           player = exoPlayer
           layoutParams = ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT,
           )
+          playerViewRef = this
         }
       },
       update = { view ->
-        view.player = exoPlayer
+        playerViewRef = view
+        if (view.player !== exoPlayer) {
+          view.player = exoPlayer
+        }
         view.resizeMode =
           if (useFillMode) AspectRatioFrameLayout.RESIZE_MODE_ZOOM
           else AspectRatioFrameLayout.RESIZE_MODE_FIT
       },
+      onRelease = { view ->
+        view.player = null
+        if (playerViewRef === view) {
+          playerViewRef = null
+        }
+      },
       modifier = Modifier.fillMaxSize(),
+    )
+
+    // Dedicated video tap surface above AndroidView so sibling overlay/error semantics remain unmerged
+    Box(
+      modifier = Modifier
+        .fillMaxSize()
+        .clickable(
+          interactionSource = remember { MutableInteractionSource() },
+          indication = null,
+        ) {
+          controlsVisible = !controlsVisible
+        },
     )
 
     if (isBuffering && !allSourcesFailed) {
@@ -271,6 +338,69 @@ fun PlayerScreen(
         modifier = Modifier.align(Alignment.Center),
       )
     }
+
+    PlayerControlsOverlay(
+      visible = controlsVisible || allSourcesFailed,
+      title = title,
+      subtitle = subtitle,
+      logoUrl = logoUrl,
+      isLive = isLive,
+      isPlaying = isPlaying,
+      isBuffering = isBuffering,
+      isMuted = isMuted,
+      volume = volume.coerceIn(0f, 1f),
+      useFillMode = useFillMode,
+      isLandscape = isLandscape,
+      allowFullscreenToggle = allowFullscreenToggle,
+      streams = streams,
+      sourceIndex = sourceIndex,
+      showSourcesMenu = showSourcesMenu,
+      isFavorite = isFavorite,
+      sleepRemainingMinutes = sleepRemainingMinutes,
+      onShowSourcesMenuChange = { showSourcesMenu = it },
+      onSelectSource = { idx -> sourceIndex = idx },
+      onTogglePlayPause = {
+        if (exoPlayer.isPlaying) {
+          exoPlayer.pause()
+        } else if (allSourcesFailed || exoPlayer.playbackState == Player.STATE_IDLE) {
+          reloadCounter += 1
+        } else {
+          exoPlayer.play()
+        }
+      },
+      onSeekToLiveEdge = {
+        if (allSourcesFailed || exoPlayer.playbackState == Player.STATE_IDLE) {
+          reloadCounter += 1
+        } else {
+          exoPlayer.seekToDefaultPosition()
+          exoPlayer.play()
+        }
+      },
+      onToggleMute = { isMuted = !isMuted },
+      onVolumeChange = { next ->
+        volume = next.coerceIn(0f, 1f)
+        if (volume > 0f && isMuted) isMuted = false
+      },
+      onReload = { reloadCounter += 1 },
+      onToggleResizeMode = { useFillMode = !useFillMode },
+      onToggleLandscape = {
+        isLandscape = !isLandscape
+        activity?.requestedOrientation =
+          if (isLandscape) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+          else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+      },
+      onToggleFavorite = onToggleFavorite,
+      onBack = if (onBack != null) {
+        {
+          if (allowFullscreenToggle) {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+          }
+          onBack()
+        }
+      } else {
+        null
+      },
+    )
 
     if (allSourcesFailed) {
       PlayerErrorCard(
@@ -295,63 +425,6 @@ fun PlayerScreen(
         modifier = Modifier.align(Alignment.Center),
       )
     }
-
-    PlayerControlsOverlay(
-      visible = controlsVisible || allSourcesFailed,
-      title = title,
-      subtitle = subtitle,
-      logoUrl = logoUrl,
-      isLive = isLive,
-      isPlaying = isPlaying,
-      isBuffering = isBuffering,
-      isMuted = isMuted,
-      volume = volume,
-      useFillMode = useFillMode,
-      isLandscape = isLandscape,
-      allowFullscreenToggle = allowFullscreenToggle,
-      streams = streams,
-      sourceIndex = sourceIndex,
-      showSourcesMenu = showSourcesMenu,
-      isFavorite = isFavorite,
-      sleepRemainingMinutes = sleepRemainingMinutes,
-      onShowSourcesMenuChange = { showSourcesMenu = it },
-      onSelectSource = { idx -> sourceIndex = idx },
-      onTogglePlayPause = {
-        if (exoPlayer.isPlaying) {
-          exoPlayer.pause()
-        } else {
-          exoPlayer.play()
-        }
-      },
-      onSeekToLiveEdge = {
-        exoPlayer.seekToDefaultPosition()
-        exoPlayer.play()
-      },
-      onToggleMute = { isMuted = !isMuted },
-      onVolumeChange = { next ->
-        volume = next
-        if (next > 0f && isMuted) isMuted = false
-      },
-      onReload = { reloadCounter += 1 },
-      onToggleResizeMode = { useFillMode = !useFillMode },
-      onToggleLandscape = {
-        isLandscape = !isLandscape
-        activity?.requestedOrientation =
-          if (isLandscape) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-          else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-      },
-      onToggleFavorite = onToggleFavorite,
-      onBack = if (onBack != null) {
-        {
-          if (allowFullscreenToggle) {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-          }
-          onBack()
-        }
-      } else {
-        null
-      },
-    )
   }
 }
 

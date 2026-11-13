@@ -1,6 +1,8 @@
 package com.example
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.ui.Modifier
@@ -20,6 +22,7 @@ import com.example.data.model.StreamSource
 import com.example.ui.ChannelHealthScanState
 import com.example.ui.player.PlayerControlsOverlay
 import com.example.ui.player.PlayerErrorCard
+import com.example.ui.player.PlayerScreen
 import com.example.ui.screens.AllChannelsScreen
 import com.example.ui.screens.CountryBrowseScreen
 import com.example.ui.screens.MenuScreen
@@ -278,5 +281,70 @@ class UiPTvRobolectricTest {
     composeTestRule.onNodeWithTag("player_retry_button").performClick()
     composeTestRule.waitForIdle()
     assertTrue(retried)
+  }
+
+  @Test
+  fun manifest_declaresWakeLockPermissionForExoPlayer() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    @Suppress("DEPRECATION")
+    val pkgInfo = context.packageManager.getPackageInfo(
+      context.packageName,
+      PackageManager.GET_PERMISSIONS,
+    )
+    val permissions = pkgInfo.requestedPermissions?.toSet().orEmpty()
+    assertTrue(Manifest.permission.WAKE_LOCK in permissions)
+  }
+
+  @Test
+  fun playerScreen_validHlsStream_initializesWithoutCrashing() {
+    var backClicked = false
+
+    composeTestRule.setContent {
+      TiweeTheme {
+        PlayerScreen(
+          streams = listOf(
+            StreamSource(
+              url = "https://stream.example.org/ddnews.m3u8",
+              title = "DD News",
+              quality = "1080p",
+              userAgent = "TestAgent/1.0\r\nInjected: bad",
+            )
+          ),
+          title = "DD News",
+          streamKey = "dd_news_in",
+          subtitle = "IN • News",
+          autoHideControlsMillis = 0L,
+          onBack = { backClicked = true },
+        )
+      }
+    }
+
+    composeTestRule.waitForIdle()
+    composeTestRule.onNodeWithTag("player_screen").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("player_back_button").performClick()
+    composeTestRule.waitForIdle()
+    assertTrue(backClicked)
+  }
+
+  @Test
+  fun playerScreen_unsupportedProtocol_showsErrorCardInsteadOfCrashing() {
+    var streamFailedNotified = false
+
+    composeTestRule.setContent {
+      TiweeTheme {
+        PlayerScreen(
+          streams = listOf(StreamSource(url = "rtmp://invalid.example.org/live")),
+          title = "Broken Channel",
+          streamKey = "broken_ch",
+          autoHideControlsMillis = 0L,
+          onStreamFailed = { streamFailedNotified = true },
+          onBack = {},
+        )
+      }
+    }
+
+    composeTestRule.waitForIdle()
+    composeTestRule.onNodeWithTag("player_error_card").assertIsDisplayed()
+    assertTrue(streamFailedNotified)
   }
 }
